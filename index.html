@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer-when-downgrade">
+    <title>Secure File Storage</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/web3/1.7.4/web3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script>
+        if (!window.crypto) {
+            window.crypto = {
+                getRandomValues: function(array) {
+                    for (let i = 0; i < array.length; i++) {
+                        array[i] = Math.floor(Math.random() * 256);
+                    }
+                    return array;
+                },
+                subtle: {
+                    importKey: async function(format, keyData, algorithm, extractable, keyUsages) {
+                        return {
+                            algorithm: algorithm,
+                            extractable: extractable,
+                            keyUsages: keyUsages,
+                            keyData: keyData
+                        };
+                    },
+                    encrypt: async function(algorithm, key, data) {
+                        const iv = algorithm.iv;
+                        const keyData = key.keyData;
+                        const keyBytes = new TextEncoder().encode(keyData);
+                        const dataBytes = new Uint8Array(data);
+                        
+                        const result = new Uint8Array(dataBytes.length);
+                        for (let i = 0; i < dataBytes.length; i++) {
+                            result[i] = dataBytes[i] ^ keyBytes[i % keyBytes.length];
+                        }
+                        
+                        return result.buffer;
+                    },
+                    decrypt: async function(algorithm, key, data) {
+                        const keyData = key.keyData;
+                        const keyBytes = new TextEncoder().encode(keyData);
+                        const dataBytes = new Uint8Array(data);
+                        
+                        const result = new Uint8Array(dataBytes.length);
+                        for (let i = 0; i < dataBytes.length; i++) {
+                            result[i] = dataBytes[i] ^ keyBytes[i % keyBytes.length];
+                        }
+                        
+                        return result.buffer;
+                    }
+                }
+            };
+        }
+    </script>
+    <script src="https://unpkg.com/ipfs-http-client@59.0.0/dist/index.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="js/key-manager.js"></script>
+</head>
+<body class="bg-gray-100 min-h-screen flex flex-col items-center justify-center p-4">
+    <div class="bg-white p-6 rounded-lg shadow-lg w-full max-w-md">
+        <h1 class="text-2xl font-bold mb-4 text-center">Secure File Storage</h1>
+        <div id="currentAccount" class="text-center mb-4 text-gray-600"></div>
+        <button id="registerButton" class="bg-yellow-500 text-white px-4 py-2 rounded w-full mb-4 hover:bg-yellow-600">Register User</button>
+        <button id="refreshButton" class="bg-gray-500 text-white px-4 py-2 rounded w-full mb-4 hover:bg-gray-600">Refresh Files</button>
+        
+        <div class="mt-4">
+            <label class="block text-sm font-medium">Transfer STK Tokens:</label>
+            <input type="text" id="transferAddress" class="w-full border rounded p-2 mb-2" placeholder="Recipient address (0x...)" />
+            <input type="number" id="transferAmount" class="w-full border rounded p-2 mb-2" placeholder="Amount of STK tokens" />
+            <button id="transferButton" class="bg-blue-500 text-white px-4 py-2 rounded w-full hover:bg-blue-600">Transfer Tokens</button>
+        </div>
+        
+        <input type="file" id="fileInput" class="mb-4 w-full border rounded p-2" />
+        <button id="uploadButton" class="bg-blue-500 text-white px-4 py-2 rounded w-full hover:bg-blue-600">Upload File</button>
+        <div class="mt-4">
+            <label class="block text-sm font-medium">Grant Access to Address:</label>
+            <input type="text" id="accessAddress" class="w-full border rounded p-2 mb-2" placeholder="0x..." />
+            <button id="grantAccessButton" class="bg-green-500 text-white px-4 py-2 rounded w-full hover:bg-green-600">Grant Access</button>
+        </div>
+        <div class="mt-4">
+            <label class="block text-sm font-medium">Revoke Access from Address:</label>
+            <input type="text" id="revokeAddress" class="w-full border rounded p-2 mb-2" placeholder="0x..." />
+            <button id="revokeAccessButton" class="bg-red-500 text-white px-4 py-2 rounded w-full hover:bg-red-600">Revoke Access</button>
+        </div>
+        <div id="balance" class="mt-4 text-center"></div>
+        <div id="fileList" class="mt-4"></div>
+        <div id="eventLog" class="mt-4 border p-2 rounded max-h-40 overflow-y-auto">
+            <h2 class="text-lg font-semibold">Event Log</h2>
+            <div id="events"></div>
+        </div>
+        <div id="auditLog" class="mt-4 border p-2 rounded max-h-40 overflow-y-auto">
+            <h2 class="text-lg font-semibold">Audit Log</h2>
+            <div id="audits"></div>
+        </div>
+    </div>
+
+    <script>
+        let ipfs = window.IpfsHttpClient.create({host: '127.0.0.1', port: 5001, protocol: 'http', timeout: '30s'});
+        let web3;
+        let fileStorageContract;
+        let tokenContract;
+        const fileStorageAddress = '...';
+        const tokenAddress = '...';
+        const fileStorageABI = [
+            {"inputs":[{"internalType":"address","name":"_tokenAddress","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"string","name":"action","type":"string"},{"indexed":false,"internalType":"string","name":"fileHash","type":"string"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"AuditLog","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"accessor","type":"address"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"AccessGranted","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"accessor","type":"address"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"AccessRevoked","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"string","name":"fileHash","type":"string"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"FileDownloaded","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"string","name":"fileHash","type":"string"},{"indexed":false,"internalType":"string","name":"fileName","type":"string"},{"indexed":false,"internalType":"string","name":"fileHashSha256","type":"string"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"FileAdded","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"string","name":"fileHash","type":"string"},{"indexed":false,"internalType":"string","name":"fileName","type":"string"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"FileDeleted","type":"event"},
+            {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"UserRegistered","type":"event"},
+            {"inputs":[{"internalType":"string","name":"_fileHash","type":"string"},{"internalType":"string","name":"_fileName","type":"string"},{"internalType":"string","name":"_fileHashSha256","type":"string"}],"name":"addFile","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"uint256","name":"_index","type":"uint256"}],"name":"deleteFile","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"address","name":"_accessor","type":"address"},{"internalType":"uint256","name":"_fileIndex","type":"uint256"}],"name":"grantAccess","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"address","name":"_accessor","type":"address"}],"name":"revokeAccess","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[],"name":"registerUser","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"string","name":"_fileHash","type":"string"}],"name":"logFileDownload","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"address","name":"_user","type":"address"}],"name":"getFiles","outputs":[{"internalType":"string[]","name":"fileHashes","type":"string[]"},{"internalType":"string[]","name":"fileNames","type":"string[]"},{"internalType":"string[]","name":"fileHashSha256s","type":"string[]"},{"internalType":"uint256[]","name":"timestamps","type":"uint256[]"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"internalType":"address","name":"_user","type":"address"}],"name":"getAuditLogs","outputs":[{"components":[{"internalType":"string","name":"action","type":"string"},{"internalType":"string","name":"fileHash","type":"string"},{"internalType":"address","name":"user","type":"address"},{"internalType":"uint256","name":"timestamp","type":"uint256"}],"internalType":"struct FileStorage.Log[]","name":"","type":"tuple[]"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"internalType":"address","name":"_owner","type":"address"},{"internalType":"address","name":"_accessor","type":"address"}],"name":"hasAccess","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+            {"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"registeredUsers","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+            {"inputs":[],"name":"token","outputs":[{"internalType":"contract IERC20","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+            {"inputs":[],"name":"uploadFee","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+        ];
+        const tokenABI = [
+            {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
+        ];
+
+        const keyManager = new KeyManager();
+
+        async function encryptFile(file) {
+            const accounts = await web3.eth.getAccounts();
+            const userAddress = accounts[0];
+            
+            const secretKey = CryptoJS.lib.WordArray.random(32).toString();
+            
+            localStorage.setItem(`secretKey_${userAddress}`, secretKey);
+            
+            const key = CryptoJS.SHA256(userAddress + secretKey).toString();
+            const fileBuffer = await file.arrayBuffer();
+            const iv = CryptoJS.lib.WordArray.random(16);
+            const keyHex = CryptoJS.enc.Hex.parse(key);
+            
+            const encrypted = CryptoJS.AES.encrypt(
+                CryptoJS.lib.WordArray.create(new Uint8Array(fileBuffer)),
+                keyHex,
+                { iv: iv }
+            );
+            
+            const result = new Blob([
+                iv.toString(),
+                encrypted.toString()
+            ]);
+            
+            const encryptedHash = await computeSha256(result);
+            
+            return { encrypted: result, iv: iv.toString(), encryptedHash };
+        }
+
+        async function decryptFile(encryptedBlob, userAddress, iv) {
+            try {
+                const secretKey = localStorage.getItem(`secretKey_${userAddress}`);
+                if (!secretKey) {
+                    throw new Error('Secret key not found. Please re-upload the file.');
+                }
+                
+                const encryptedText = await encryptedBlob.text();
+                console.log('Encrypted text length:', encryptedText.length);
+                
+                const key = CryptoJS.SHA256(userAddress + secretKey).toString();
+                const keyHex = CryptoJS.enc.Hex.parse(key);
+                const ivHex = CryptoJS.enc.Hex.parse(iv);
+                
+                const decrypted = CryptoJS.AES.decrypt(
+                    encryptedText,
+                    keyHex,
+                    { iv: ivHex }
+                );
+                
+                const decryptedArray = new Uint8Array(decrypted.words.length * 4);
+                for (let i = 0; i < decrypted.words.length; i++) {
+                    decryptedArray[i * 4] = (decrypted.words[i] >>> 24) & 0xFF;
+                    decryptedArray[i * 4 + 1] = (decrypted.words[i] >>> 16) & 0xFF;
+                    decryptedArray[i * 4 + 2] = (decrypted.words[i] >>> 8) & 0xFF;
+                    decryptedArray[i * 4 + 3] = decrypted.words[i] & 0xFF;
+                }
+                
+                return new Blob([decryptedArray.buffer], { type: 'application/octet-stream' });
+            } catch (error) {
+                console.error('Error in decryptFile:', error);
+                throw error;
+            }
+        }
+
+        async function computeSha256(blob) {
+            try {
+                const buffer = await blob.arrayBuffer();
+                const hash = CryptoJS.SHA256(CryptoJS.lib.WordArray.create(new Uint8Array(buffer)));
+                return hash.toString(CryptoJS.enc.Hex);
+            } catch (error) {
+                console.error('Error computing SHA-256:', error);
+                throw error;
+            }
+        }
+
+        async function initWeb3() {
+            if (window.ethereum) {
+                web3 = new Web3(window.ethereum);
+                await window.ethereum.request({ method: 'eth_requestAccounts' });
+                fileStorageContract = new web3.eth.Contract(fileStorageABI, fileStorageAddress);
+                tokenContract = new web3.eth.Contract(tokenABI, tokenAddress);
+                
+                await checkAccount();
+                
+                window.ethereum.on('accountsChanged', async (accounts) => {
+                    console.log('Account changed:', accounts[0]);
+                    await checkAccount();
+                });
+                
+                window.ethereum.on('chainChanged', () => {
+                    window.location.reload();
+                });
+            } else {
+                alert('Установите MetaMask!');
+            }
+        }
+
+        async function checkAccount() {
+            try {
+                const accounts = await web3.eth.getAccounts();
+                if (!accounts || accounts.length === 0) {
+                    alert('Пожалуйста, подключите MetaMask и выберите аккаунт');
+                    return;
+                }
+                
+                const currentAccount = accounts[0];
+                console.log('Current account:', currentAccount);
+                
+                const isRegistered = await fileStorageContract.methods.registeredUsers(currentAccount).call();
+                console.log('Is registered:', isRegistered);
+                
+                if (!isRegistered) {
+                    alert('Пожалуйста, зарегистрируйте аккаунт перед использованием системы.');
+                }
+                
+                await loadBalance();
+                await loadFiles();
+                
+                document.getElementById('currentAccount').textContent = `Текущий аккаунт: ${currentAccount}`;
+            } catch (error) {
+                console.error('Error checking account:', error);
+                alert('Ошибка при проверке аккаунта: ' + error.message);
+            }
+        }
+
+        async function loadBalance() {
+            const accounts = await web3.eth.getAccounts();
+            const balance = await tokenContract.methods.balanceOf(accounts[0]).call();
+            document.getElementById('balance').innerHTML = `Баланс токенов: ${web3.utils.fromWei(balance, 'ether')} STK`;
+        }
+
+        async function registerUser() {
+            const accounts = await web3.eth.getAccounts();
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            if (isRegistered) {
+                alert('User already registered');
+                return;
+            }
+            await fileStorageContract.methods.registerUser().send({ from: accounts[0] });
+            alert('User registered successfully!');
+            loadBalance();
+            loadFiles();
+        }
+
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('Выберите файл');
+                return;
+            }
+            
+            const accounts = await web3.eth.getAccounts();
+            if (!accounts || accounts.length === 0) {
+                alert('Пожалуйста, подключите MetaMask и выберите аккаунт');
+                return;
+            }
+
+            console.log('Current account:', accounts[0]);
+
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            console.log('Is registered:', isRegistered);
+            if (!isRegistered) {
+                alert('Пожалуйста, зарегистрируйте аккаунт перед загрузкой файлов');
+                return;
+            }
+
+            const balance = await tokenContract.methods.balanceOf(accounts[0]).call();
+            const uploadFee = await fileStorageContract.methods.uploadFee().call();
+            console.log('Token balance:', web3.utils.fromWei(balance, 'ether'));
+            console.log('Upload fee:', web3.utils.fromWei(uploadFee, 'ether'));
+            
+            if (BigInt(balance) < BigInt(uploadFee)) {
+                alert(`Недостаточно токенов. Требуется: ${web3.utils.fromWei(uploadFee, 'ether')} STK`);
+                return;
+            }
+
+            try {
+                const allowance = await tokenContract.methods.allowance(accounts[0], fileStorageAddress).call();
+                console.log('Current allowance:', web3.utils.fromWei(allowance, 'ether'));
+                
+                if (BigInt(allowance) < BigInt(uploadFee)) {
+                    console.log('Approving token transfer...');
+                    const approvalTx = await tokenContract.methods.approve(fileStorageAddress, uploadFee).send({ 
+                        from: accounts[0],
+                        gas: 3000000,
+                        gasPrice: web3.utils.toWei('10', 'gwei')
+                    });
+                    console.log('Approval transaction:', approvalTx);
+                    
+                    const approvalReceipt = await web3.eth.getTransactionReceipt(approvalTx.transactionHash);
+                    if (!approvalReceipt) {
+                        throw new Error('Транзакция одобрения не была подтверждена');
+                    }
+                    console.log('Approval receipt:', approvalReceipt);
+                }
+            } catch (error) {
+                console.error('Ошибка при проверке разрешения:', error);
+                alert('Ошибка при проверке разрешения на использование токенов');
+                return;
+            }
+            
+            document.getElementById('balance').innerHTML = 'Шифрование файла...';
+            const { encrypted, iv, encryptedHash } = await encryptFile(file);
+            
+            document.getElementById('balance').innerHTML = 'Загрузка в IPFS...';
+            const result = await ipfs.add(encrypted, { pin: true });
+            const fileHash = result.path;
+            console.log('IPFS hash:', fileHash);
+            
+            const ownerAddress = await fileStorageContract.methods.owner().call();
+            console.log('Contract owner:', ownerAddress);
+            
+            try {
+                const fileAddedEvents = await fileStorageContract.getPastEvents('FileAdded', { 
+                    fromBlock: 0, 
+                    toBlock: 'latest' 
+                });
+                console.log('FileAdded events:', fileAddedEvents);
+                
+                for (const event of fileAddedEvents) {
+                    if (event.returnValues.fileHashSha256 === encryptedHash) {
+                        alert('Файл с таким SHA256 хешем уже существует в системе. Пожалуйста, измените содержимое файла или его имя и попробуйте снова.');
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка при проверке событий:', error);
+            }
+            
+            document.getElementById('balance').innerHTML = 'Сохранение в блокчейн...';
+            try {
+                console.log('Preparing addFile transaction...');
+                console.log('Parameters:', {
+                    fileHash,
+                    fileName: file.name,
+                    fileHashSha256: encryptedHash,
+                    from: accounts[0],
+                    gas: 3000000,
+                    gasPrice: web3.utils.toWei('10', 'gwei')
+                });
+                
+                if (!fileHash || !file.name || !encryptedHash) {
+                    throw new Error('Некорректные параметры файла');
+                }
+                
+                const tx = await fileStorageContract.methods.addFile(fileHash, file.name, encryptedHash).send({ 
+                    from: accounts[0],
+                    gas: 3000000,
+                    gasPrice: web3.utils.toWei('10', 'gwei')
+                });
+                
+                const receipt = await web3.eth.getTransactionReceipt(tx.transactionHash);
+                if (!receipt) {
+                    throw new Error('Транзакция не была подтверждена');
+                }
+                
+                console.log('AddFile transaction:', tx);
+                console.log('Transaction receipt:', receipt);
+                alert('Файл успешно загружен!');
+            } catch (error) {
+                console.error('Ошибка при загрузке файла:', error);
+                
+                try {
+                    const allowance = await tokenContract.methods.allowance(accounts[0], fileStorageAddress).call();
+                    if (BigInt(allowance) < BigInt(uploadFee)) {
+                        alert('Недостаточно разрешения на использование токенов. Пожалуйста, одобрите транзакцию.');
+                        return;
+                    }
+                } catch (allowanceError) {
+                    console.error('Ошибка при проверке разрешения:', allowanceError);
+                }
+                
+                const isOwner = ownerAddress.toLowerCase() === accounts[0].toLowerCase();
+                console.log('Is contract owner:', isOwner);
+                
+                if (!isOwner) {
+                    alert('Ошибка доступа. Проверьте, что вы зарегистрированы и имеете необходимые разрешения.');
+                    return;
+                }
+                
+                alert('Ошибка при загрузке файла. Проверьте консоль для подробностей.');
+            }
+            
+            loadBalance();
+            loadFiles();
+        }
+
+        async function grantAccess() {
+            const accessAddress = document.getElementById('accessAddress').value;
+            if (!web3.utils.isAddress(accessAddress)) {
+                alert('Введите корректный Ethereum-адрес');
+                return;
+            }
+            const accounts = await web3.eth.getAccounts();
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            if (!isRegistered) {
+                alert('Please register your account before granting access.');
+                return;
+            }
+            const isAccessorRegistered = await fileStorageContract.methods.registeredUsers(accessAddress).call();
+            if (!isAccessorRegistered) {
+                alert('Recipient must be registered. Ask them to register their account.');
+                return;
+            }
+            
+            try {
+                const files = await fileStorageContract.methods.getFiles(accounts[0]).call({ from: accounts[0] });
+                if (!files || !files.fileHashes || files.fileHashes.length === 0) {
+                    alert('No files to grant access to.');
+                    return;
+                }
+                
+                const fileIndex = prompt('Enter file index to grant access (0 to ' + (files.fileHashes.length - 1) + '):');
+                if (fileIndex === null || isNaN(fileIndex) || fileIndex < 0 || fileIndex >= files.fileHashes.length) {
+                    alert('Invalid file index');
+                    return;
+                }
+                
+                await fileStorageContract.methods.grantAccess(accessAddress, fileIndex).send({ from: accounts[0] });
+                alert('Доступ предоставлен для ' + accessAddress);
+                loadFiles();
+            } catch (error) {
+                console.error('Error in grantAccess:', error);
+                alert('Ошибка при предоставлении доступа: ' + error.message);
+            }
+        }
+
+        async function revokeAccess() {
+            const revokeAddress = document.getElementById('revokeAddress').value;
+            if (!web3.utils.isAddress(revokeAddress)) {
+                alert('Введите корректный Ethereum-адрес');
+                return;
+            }
+            const accounts = await web3.eth.getAccounts();
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            if (!isRegistered) {
+                alert('Please register your account before revoking access.');
+                return;
+            }
+            await fileStorageContract.methods.revokeAccess(revokeAddress).send({ from: accounts[0] });
+            alert('Доступ отозван для ' + revokeAddress);
+            loadFiles();
+        }
+
+        async function deleteFile(index, fileHash) {
+            const accounts = await web3.eth.getAccounts();
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            if (!isRegistered) {
+                alert('Please register your account before deleting files.');
+                return;
+            }
+            try {
+                await ipfs.pin.rm(fileHash);
+                await ipfs.repo.gc();
+            } catch (ipfsError) {
+                alert('Warning: Failed to remove file from IPFS. It may still be accessible. Continuing with blockchain deletion.');
+            }
+            await fileStorageContract.methods.deleteFile(index).send({ from: accounts[0] });
+            alert('File deleted successfully!');
+            loadFiles();
+        }
+
+        async function downloadAndDecrypt(fileHash, fileName, expectedSha256, owner) {
+            const accounts = await web3.eth.getAccounts();
+            const isRegistered = await fileStorageContract.methods.registeredUsers(accounts[0]).call();
+            if (!isRegistered) {
+                alert('Please register your account before downloading files.');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://127.0.0.1:8080/ipfs/${fileHash}?cache-bust=${Date.now()}`);
+                if (!response.ok) throw new Error(`Failed to fetch file from IPFS: ${response.status} ${response.statusText}`);
+                
+                const encryptedBlob = await response.blob();
+                if (!encryptedBlob || encryptedBlob.size === 0) throw new Error('Invalid encrypted blob: Blob is empty');
+                
+                const encryptedText = await encryptedBlob.text();
+                console.log('Encrypted text length:', encryptedText.length);
+                
+                const iv = encryptedText.substring(0, 32);
+                const encryptedData = encryptedText.substring(32);
+                console.log('Retrieved IV:', iv);
+                console.log('Using owner address for decryption:', owner);
+                
+                const computedEncryptedHash = await computeSha256(encryptedBlob);
+                console.log('Expected encrypted SHA-256:', expectedSha256);
+                console.log('Computed encrypted SHA-256:', computedEncryptedHash);
+                
+                if (computedEncryptedHash !== expectedSha256) {
+                    console.error('SHA-256 mismatch detected');
+                    console.error('Expected:', expectedSha256);
+                    console.error('Got:', computedEncryptedHash);
+                    throw new Error('SHA-256 mismatch: File may be corrupted');
+                }
+                
+                const decryptedData = await decryptFile(new Blob([encryptedData]), owner, iv);
+                console.log('Decrypted data size:', decryptedData.size);
+                
+                // Логируем скачивание
+                await fileStorageContract.methods.logFileDownload(fileHash).send({ from: accounts[0] });
+                
+                // Скачиваем файл
+                const url = URL.createObjectURL(decryptedData);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                a.click();
+                URL.revokeObjectURL(url);
+                alert('Файл успешно скачан и проверен!');
+            } catch (error) {
+                console.error('Error during decryption:', error);
+                alert('Ошибка при дешифровке файла: ' + error.message);
+            }
+        }
+
+        // Добавляем функцию для скачивания файла по IPFS ссылке
+        async function downloadIPFSFile(fileHash, fileName) {
+            try {
+                const response = await fetch(`http://127.0.0.1:8080/ipfs/${fileHash}?cache-bust=${Date.now()}`);
+                if (!response.ok) throw new Error(`Failed to fetch file from IPFS: ${response.status} ${response.statusText}`);
+                const blob = await response.blob();
+                
+                // Создаем новый Blob с правильным типом содержимого
+                const newBlob = new Blob([blob], { type: 'application/octet-stream' });
+                const url = URL.createObjectURL(newBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName || `ipfs-${fileHash}`;
+                a.click();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                console.error('Error downloading IPFS file:', error);
+                alert('Ошибка при скачивании файла: ' + error.message);
+            }
+        }
+
+        async function loadFiles() {
+            const accounts = await web3.eth.getAccounts();
+            const currentAccount = accounts[0];
+            console.log('Loading files for account:', currentAccount);
+            
+            const isRegistered = await fileStorageContract.methods.registeredUsers(currentAccount).call();
+            console.log('Is registered:', isRegistered);
+            
+            if (!isRegistered) {
+                document.getElementById('fileList').innerHTML = 'Please register your account to view files.';
+                return;
+            }
+            
+            const fileList = document.getElementById('fileList');
+            fileList.innerHTML = '';
+            let ownFiles = [];
+            
+            try {
+                console.log('Fetching own files...');
+                const files = await fileStorageContract.methods.getFiles(currentAccount).call({ from: currentAccount });
+                console.log('Own files response:', files);
+                
+                if (files && files.fileHashes && files.fileHashes.length > 0) {
+                    console.log('Number of own files:', files.fileHashes.length);
+                    
+                    for (let i = 0; i < files.fileHashes.length; i++) {
+                        ownFiles.push({ 
+                            fileHash: files.fileHashes[i], 
+                            fileName: files.fileNames[i], 
+                            fileHashSha256: files.fileHashSha256s[i], 
+                            timestamp: files.timestamps[i] 
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching own files:', error);
+            }
+            
+            // Отображаем собственные файлы
+            ownFiles.forEach((file, index) => {
+                const fileItem = document.createElement('div');
+                fileItem.className = 'border p-2 my-2 rounded';
+                fileItem.innerHTML = `
+                    Owner: ${currentAccount} (You)<br>
+                    Name: ${file.fileName}<br>
+                    IPFS Hash: <a href="#" class="text-blue-500 ipfs-download" data-hash="${file.fileHash}" data-name="${file.fileName}">${file.fileHash}</a><br>
+                    SHA-256: ${file.fileHashSha256}<br>
+                    <button class="download-file bg-purple-500 text-white px-2 py-1 rounded mt-2 mr-2 hover:bg-purple-600" 
+                            data-hash="${file.fileHash}" 
+                            data-name="${file.fileName}" 
+                            data-sha256="${file.fileHashSha256}"
+                            data-owner="${currentAccount}">
+                        Download and Decrypt
+                    </button>
+                    <button class="delete-file bg-red-500 text-white px-2 py-1 rounded mt-2 hover:bg-red-600" 
+                            data-index="${index}" 
+                            data-hash="${file.fileHash}">
+                        Delete
+                    </button>
+                `;
+                fileList.appendChild(fileItem);
+            });
+            
+            // Получаем список всех пользователей через события
+            try {
+                console.log('Fetching FileAdded events...');
+                const fileAddedEvents = await fileStorageContract.getPastEvents('FileAdded', { 
+                    fromBlock: 0, 
+                    toBlock: 'latest' 
+                });
+                console.log('FileAdded events:', fileAddedEvents);
+                
+                const owners = [...new Set(fileAddedEvents.map(event => event.returnValues.user))];
+                console.log('Unique owners:', owners);
+                
+                for (const owner of owners) {
+                    if (owner.toLowerCase() === currentAccount.toLowerCase()) continue;
+                    
+                    try {
+                        console.log('Fetching files for owner:', owner);
+                        const files = await fileStorageContract.methods.getFiles(owner).call({ from: owner });
+                        console.log('Files for owner:', files);
+                        
+                        if (files && files.fileHashes && files.fileHashes.length > 0) {
+                            for (let i = 0; i < files.fileHashes.length; i++) {
+                                try {
+                                    // Проверяем доступ к конкретному файлу
+                                    const hasAccess = await fileStorageContract.methods.hasAccess(owner, currentAccount).call();
+                                    console.log(`Access check for file ${files.fileHashes[i]}:`, hasAccess);
+                                    
+                                    if (hasAccess) {
+                                        const fileItem = document.createElement('div');
+                                        fileItem.className = 'border p-2 my-2 rounded';
+                                        fileItem.innerHTML = `
+                                            Owner: ${owner}<br>
+                                            Name: ${files.fileNames[i]}<br>
+                                            IPFS Hash: <a href="#" class="text-blue-500 ipfs-download" data-hash="${files.fileHashes[i]}" data-name="${files.fileNames[i]}">${files.fileHashes[i]}</a><br>
+                                            SHA-256: ${files.fileHashSha256s[i]}<br>
+                                            <button class="download-file bg-purple-500 text-white px-2 py-1 rounded mt-2 hover:bg-purple-600" 
+                                                    data-hash="${files.fileHashes[i]}" 
+                                                    data-name="${files.fileNames[i]}" 
+                                                    data-sha256="${files.fileHashSha256s[i]}"
+                                                    data-owner="${owner}">
+                                                Download and Decrypt
+                                            </button>
+                                        `;
+                                        fileList.appendChild(fileItem);
+                                    }
+                                } catch (accessError) {
+                                    console.error('Error checking access for file:', accessError);
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error fetching files for owner:', owner, error);
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching FileAdded events:', error);
+            }
+            
+            // Добавляем обработчики событий для кнопок
+            document.querySelectorAll('.download-file').forEach(button => {
+                button.addEventListener('click', () => {
+                    const fileHash = button.getAttribute('data-hash');
+                    const fileName = button.getAttribute('data-name');
+                    const expectedSha256 = button.getAttribute('data-sha256');
+                    const owner = button.getAttribute('data-owner');
+                    downloadAndDecrypt(fileHash, fileName, expectedSha256, owner);
+                });
+            });
+            
+            // Добавляем обработчики для IPFS ссылок
+            document.querySelectorAll('.ipfs-download').forEach(link => {
+                link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    const fileHash = link.getAttribute('data-hash');
+                    const fileName = link.getAttribute('data-name');
+                    downloadIPFSFile(fileHash, fileName);
+                });
+            });
+            
+            document.querySelectorAll('.delete-file').forEach(button => {
+                button.addEventListener('click', () => {
+                    const index = button.getAttribute('data-index');
+                    const fileHash = button.getAttribute('data-hash');
+                    if (confirm('Are you sure you want to delete this file?')) {
+                        deleteFile(index, fileHash);
+                    }
+                });
+            });
+            
+            if (fileList.innerHTML === '') {
+                fileList.innerHTML = 'No files available or no access granted.';
+            }
+        }
+
+        function subscribeToEvents() {
+            const eventsDiv = document.getElementById('events');
+            const auditsDiv = document.getElementById('audits');
+            async function loadPastEvents(eventName) {
+                const events = await fileStorageContract.getPastEvents(eventName, { fromBlock: 0, toBlock: 'latest' });
+                events.forEach(event => {
+                    const eventItem = document.createElement('div');
+                    eventItem.className = 'text-sm text-gray-600';
+                    if (eventName === 'FileAdded') {
+                        const { user, fileName, fileHash, fileHashSha256, timestamp } = event.returnValues;
+                        eventItem.textContent = `FileAdded: ${user} uploaded ${fileName} (IPFS: ${fileHash}, SHA-256: ${fileHashSha256}) at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'FileDeleted') {
+                        const { user, fileHash, fileName, timestamp } = event.returnValues;
+                        eventItem.textContent = `FileDeleted: ${user} deleted ${fileName} (IPFS: ${fileHash}) at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'AccessGranted') {
+                        const { owner, accessor, timestamp } = event.returnValues;
+                        eventItem.textContent = `AccessGranted: ${owner} granted access to ${accessor} at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'AccessRevoked') {
+                        const { owner, accessor, timestamp } = event.returnValues;
+                        eventItem.textContent = `AccessRevoked: ${owner} revoked access from ${accessor} at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'UserRegistered') {
+                        const { user, timestamp } = event.returnValues;
+                        eventItem.textContent = `UserRegistered: ${user} registered at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'FileDownloaded') {
+                        const { user, fileHash, timestamp } = event.returnValues;
+                        eventItem.textContent = `FileDownloaded: ${user} downloaded ${fileHash} at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        eventsDiv.appendChild(eventItem);
+                    } else if (eventName === 'AuditLog') {
+                        const { user, action, fileHash, timestamp } = event.returnValues;
+                        eventItem.textContent = `AuditLog: ${user} performed ${action} ${fileHash ? 'on ' + fileHash : ''} at ${new Date(timestamp * 1000).toLocaleString()}`;
+                        auditsDiv.appendChild(eventItem);
+                    }
+                });
+            }
+            loadPastEvents('FileAdded');
+            loadPastEvents('FileDeleted');
+            loadPastEvents('AccessGranted');
+            loadPastEvents('AccessRevoked');
+            loadPastEvents('UserRegistered');
+            loadPastEvents('FileDownloaded');
+            loadPastEvents('AuditLog');
+        }
+
+        async function transferTokens() {
+            const recipientAddress = document.getElementById('transferAddress').value;
+            const amount = document.getElementById('transferAmount').value;
+            
+            if (!web3.utils.isAddress(recipientAddress)) {
+                alert('Введите корректный Ethereum-адрес');
+                return;
+            }
+            
+            if (!amount || isNaN(amount) || amount <= 0) {
+                alert('Введите корректное количество токенов');
+                return;
+            }
+            
+            const accounts = await web3.eth.getAccounts();
+            const currentAccount = accounts[0];
+            
+            try {
+                // Конвертируем количество токенов в wei
+                const amountInWei = web3.utils.toWei(amount, 'ether');
+                
+                // Проверяем баланс отправителя
+                const balance = await tokenContract.methods.balanceOf(currentAccount).call();
+                if (BigInt(balance) < BigInt(amountInWei)) {
+                    alert('Недостаточно токенов для перевода');
+                    return;
+                }
+                
+                // Выполняем перевод
+                const tx = await tokenContract.methods.transfer(recipientAddress, amountInWei).send({
+                    from: currentAccount,
+                    gas: 2000000,
+                    gasPrice: web3.utils.toWei('5', 'gwei')
+                });
+                
+                // Ждем подтверждения транзакции
+                const receipt = await web3.eth.getTransactionReceipt(tx.transactionHash);
+                if (!receipt) {
+                    throw new Error('Транзакция не была подтверждена');
+                }
+                
+                console.log('Transfer transaction:', tx);
+                console.log('Transfer receipt:', receipt);
+                alert('Токены успешно переведены!');
+                
+                // Обновляем баланс
+                await loadBalance();
+            } catch (error) {
+                console.error('Ошибка при переводе токенов:', error);
+                alert('Ошибка при переводе токенов: ' + error.message);
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Добавляем элемент для отображения текущего аккаунта
+            const accountDisplay = document.createElement('div');
+            accountDisplay.id = 'currentAccount';
+            accountDisplay.className = 'text-center mb-4 text-gray-600';
+            document.querySelector('.bg-white').insertBefore(accountDisplay, document.querySelector('h1'));
+            
+            document.getElementById('uploadButton').addEventListener('click', uploadFile);
+            document.getElementById('grantAccessButton').addEventListener('click', grantAccess);
+            document.getElementById('revokeAccessButton').addEventListener('click', revokeAccess);
+            document.getElementById('registerButton').addEventListener('click', registerUser);
+            document.getElementById('refreshButton').addEventListener('click', loadFiles);
+            
+            // Добавляем обработчик для кнопки перевода токенов
+            document.getElementById('transferButton').addEventListener('click', transferTokens);
+        });
+
+        window.onload = initWeb3;
+    </script>
+</body>
+</html>
